@@ -318,6 +318,15 @@ pub fn evaluate_expression(
                 "ToJson operator requires STRING output, but got {data_type:?}"
             ))),
         },
+        (Unary(UnaryExpression { op: MapLen, expr }), result_type) => match result_type {
+            None | Some(&DataType::INTEGER) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                Ok(Arc::new(map_len(&input)?))
+            }
+            Some(data_type) => Err(KernelError::invalid_expression(format!(
+                "MapLen operator requires INTEGER output, but got {data_type:?}"
+            ))),
+        },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -593,6 +602,51 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
     }
 }
 
+/// Number of entries per row of a map array. A NULL map row yields NULL.
+fn map_len(map: &ArrayRef) -> KernelResult<arrow_array::Int32Array> {
+    let map = as_map_array(map, "MapLen")?;
+    let offsets = map.value_offsets();
+    let lengths = (0..map.len()).map(|i| (!map.is_null(i)).then(|| offsets[i + 1] - offsets[i]));
+    Ok(lengths.collect())
+}
+
+/// Whether each row of a map array contains the key at the same row of `key`. A NULL map row or a
+/// NULL key yields NULL.
+fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
+    let map = as_map_array(map, "MapHasKey")?;
+    let map_keys = map.keys();
+    if key.data_type() != map_keys.data_type() {
+        return Err(KernelError::invalid_expression(format!(
+            "MapHasKey requires a key of the map key type {:?}, but got {:?}",
+            map_keys.data_type(),
+            key.data_type()
+        )));
+    }
+    let offsets = map.value_offsets();
+    let mut has_key = Vec::with_capacity(map.len());
+    for row in 0..map.len() {
+        if map.is_null(row) || key.is_null(row) {
+            has_key.push(None);
+            continue;
+        }
+        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let candidates = map_keys.slice(start, end - start);
+        let needle = arrow_array::Scalar::new(key.slice(row, 1));
+        let matches = eq(&candidates, &needle)?;
+        has_key.push(Some(matches.true_count() > 0));
+    }
+    Ok(BooleanArray::from(has_key))
+}
+
+fn as_map_array<'a>(array: &'a ArrayRef, op: &str) -> KernelResult<&'a MapArray> {
+    array.as_map_opt().ok_or_else(|| {
+        KernelError::invalid_expression(format!(
+            "{op} requires a map input, but got {:?}",
+            array.data_type()
+        ))
+    })
+}
+
 /// This function converts  Arrow types to their Arrow view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
@@ -726,6 +780,11 @@ pub fn evaluate_predicate(
                 (Distinct, false) => distinct,
                 (Distinct, true) => not_distinct,
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
+                (MapHasKey, _) => {
+                    let map = evaluate_expression(left, batch, None)?;
+                    let key = evaluate_expression(right, batch, None)?;
+                    return Ok(maybe_inverted(Cow::Owned(map_has_key(&map, &key)?))?);
+                }
             };
 
             let left = evaluate_expression(left, batch, None)?;
@@ -2658,6 +2717,126 @@ mod tests {
 
         assert_eq!(result.len(), len);
         assert_eq!(result.null_count(), len);
+    }
+
+    // ==================== Map accessor Tests ====================
+
+    fn create_accessor_map_batch() -> RecordBatch {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("a");
+        builder.values().append_value("1");
+        builder.keys().append_value("b");
+        builder.values().append_value("2");
+        builder.append(true).unwrap();
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.keys().append_value("c");
+        builder.values().append_null();
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+
+        let keys = StringArray::from(vec![Some("a"), Some("a"), Some("a"), Some("c")]);
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("m", map_array.data_type().clone(), true),
+            ArrowField::new("k", ArrowDataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array), Arc::new(keys)]).unwrap()
+    }
+
+    #[test]
+    fn test_map_len() {
+        let batch = create_accessor_map_batch();
+        let expr = Expr::map_len(col!("m"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let expected = Int32Array::from(vec![Some(2), Some(0), None, Some(1)]);
+        assert_eq!(result.as_primitive::<Int32Type>(), &expected);
+    }
+
+    #[test]
+    fn test_map_len_rejects_non_integer_output() {
+        let batch = create_accessor_map_batch();
+        let expr = Expr::map_len(col!("m"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::LONG));
+        assert_result_error_with_message(result, "MapLen operator requires INTEGER output");
+    }
+
+    #[test]
+    fn test_map_len_rejects_non_map_input() {
+        let batch = create_accessor_map_batch();
+        let expr = Expr::map_len(col!("k"));
+        let result = evaluate_expression(&expr, &batch, None);
+        assert_result_error_with_message(result, "MapLen requires a map input");
+    }
+
+    #[test]
+    fn test_map_len_on_sliced_map() {
+        let batch = create_accessor_map_batch().slice(1, 3);
+        let expr = Expr::map_len(col!("m"));
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let expected = Int32Array::from(vec![Some(0), None, Some(1)]);
+        assert_eq!(result.as_primitive::<Int32Type>(), &expected);
+    }
+
+    #[rstest]
+    #[case::present_key("b", vec![Some(true), Some(false), None, Some(false)])]
+    #[case::missing_key("z", vec![Some(false), Some(false), None, Some(false)])]
+    #[case::null_valued_entry("c", vec![Some(false), Some(false), None, Some(true)])]
+    fn test_map_has_key_literal_key(#[case] key: &str, #[case] expected: Vec<Option<bool>>) {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("m"), lit(key));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result, BooleanArray::from(expected));
+    }
+
+    #[test]
+    fn test_map_has_key_column_key() {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("m"), col!("k"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let expected = BooleanArray::from(vec![Some(true), Some(false), None, Some(true)]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_map_has_key_null_key_yields_null() {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("m"), null_lit(DataType::STRING));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.null_count(), 4);
+    }
+
+    #[test]
+    fn test_map_has_key_inverted_keeps_nulls() {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::not(Pred::map_has_key(col!("m"), lit("a")));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let expected = BooleanArray::from(vec![Some(false), Some(true), None, Some(true)]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_map_has_key_on_sliced_map() {
+        let batch = create_accessor_map_batch().slice(1, 3);
+        let pred = Pred::map_has_key(col!("m"), col!("k"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let expected = BooleanArray::from(vec![Some(false), None, Some(true)]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_map_has_key_rejects_key_type_mismatch() {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("m"), lit(1_i32));
+        let result = evaluate_predicate(&pred, &batch, false);
+        assert_result_error_with_message(result, "MapHasKey requires a key of the map key type");
+    }
+
+    #[test]
+    fn test_map_has_key_rejects_non_map_input() {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("k"), lit("a"));
+        let result = evaluate_predicate(&pred, &batch, false);
+        assert_result_error_with_message(result, "MapHasKey requires a map input");
     }
 
     // ==================== MapToStruct Tests ====================

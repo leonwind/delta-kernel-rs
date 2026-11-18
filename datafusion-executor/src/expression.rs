@@ -76,6 +76,9 @@ pub fn to_df_expr(
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
+            UnaryExpressionOp::MapLen => Err(KernelError::unsupported(
+                "converting the MapLen expression is not yet supported",
+            )),
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.

@@ -75,6 +75,11 @@ fn binary_to_df_predicate_expr(
         KernelBinaryPredicateOp::LessThan => Operator::Lt,
         KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
         KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
+        KernelBinaryPredicateOp::MapHasKey => {
+            return Err(KernelError::unsupported(
+                "converting the MapHasKey predicate is not yet supported",
+            ));
+        }
     };
     let left = to_df_expr(&binary.left, input_schema, None)?;
     let right = to_df_expr(&binary.right, input_schema, None)?;
